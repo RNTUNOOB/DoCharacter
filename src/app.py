@@ -134,6 +134,9 @@ if os.path.exists(timeline_path):
         st.sidebar.warning("Timeline file corrupt.")
         timeline_data = []
 
+# Initialize selected_arc_idx with a default (Arc 1)
+selected_arc_idx = 1
+
 if timeline_data:
     total_arcs = len(timeline_data)
     if total_arcs > 0:
@@ -272,7 +275,8 @@ if prompt := st.chat_input(f"Message {selected_char}..."):
                 current_arc_context=current_mood_context,
                 history=current_history,
                 all_characters_data=characters,
-                full_timeline_data=timeline_data
+                full_timeline_data=timeline_data,
+                selected_arc_id=selected_arc_idx  # <-- PASSING THE ID HERE
             )
             if "response" in response_data:
                 st.markdown(response_data["response"])

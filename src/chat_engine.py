@@ -20,7 +20,6 @@ CHAT_HISTORY_FILE = "conversation_history.jsonl"
 logger = logging.getLogger("ChatEngine")
 logger.setLevel(logging.INFO)
 
-# Clear existing handlers to prevent duplicates on Streamlit reload
 if logger.hasHandlers():
     logger.handlers.clear()
 
@@ -32,18 +31,19 @@ sh = logging.StreamHandler()
 sh.setFormatter(formatter)
 logger.addHandler(sh)
 
-# Reduce noise from libraries
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("chromadb").setLevel(logging.ERROR)
 
-def log_conversation_turn(book, char, user_query, bot_response, latency, context_len):
+def log_conversation_turn(book, char, user_query, bot_response, latency, context_len, arc_id=None):
     """
     Appends a structured JSON log entry for replayability and analysis.
+    Now includes 'arc_id' to track narrative progression.
     """
     entry = {
         "timestamp": datetime.datetime.now().isoformat(),
         "book": book,
         "character": char,
+        "arc_id": arc_id,
         "latency_sec": round(latency, 2),
         "context_chars": context_len,
         "user_query": user_query,
@@ -59,13 +59,11 @@ class ChatController:
     def __init__(self):
         logger.info(f"⚡ Initializing Chat Engine with {LLM_MODEL}...")
         
-        # 1. Initialize Embeddings
         self.embeddings = HuggingFaceEmbeddings(
             model_name=EMBED_MODEL_ID,
             model_kwargs={'device': 'cpu', 'trust_remote_code': True}
         )
 
-        # 2. Initialize LLMs
         self.llm_creative = ChatOllama(
             model=LLM_MODEL,
             temperature=0.75,
@@ -86,7 +84,6 @@ class ChatController:
         self.current_book_path = None
 
     def load_book_resources(self, book_path):
-        """Loads the vector DB and JSON files for a specific book."""
         if self.current_book_path == book_path and self.vector_store:
             return
 
@@ -111,7 +108,6 @@ class ChatController:
             logger.error(f"Failed to load Vector DB: {e}")
             self.vector_store = None
 
-        # Load Knowledge Base (Facts)
         kb_path = os.path.join(book_path, "knowledge.json")
         if os.path.exists(kb_path):
             try:
@@ -123,27 +119,19 @@ class ChatController:
         self.current_book_path = book_path
 
     def unload_resources(self):
-        """
-        Releases the vector store and clears memory to prevent file locks.
-        This allows ingest_pipeline to overwrite the DB without crashing.
-        """
         logger.info("🔓 Unloading resources and releasing DB locks...")
         self.vector_store = None
         self.retriever = None
         self.knowledge_base = []
         self.current_book_path = None
-        
-        # Force garbage collection to ensure SQLite connections close
         gc.collect()
 
     def get_context(self, query):
-        """Retrieves text chunks and relevant facts."""
         text_context = ""
         if self.retriever:
             docs = self.retriever.invoke(query)
             text_context = "\n---\n".join([d.page_content for d in docs])
 
-        # Simple keyword search for facts
         facts = []
         q_terms = query.lower().split()
         for entry in self.knowledge_base[:500]: 
@@ -153,7 +141,7 @@ class ChatController:
         fact_context = "\n".join(facts[:10])
         return text_context, fact_context
 
-    def chat(self, user_query, char_name, char_data, current_arc_context, history=None, all_characters_data=None, full_timeline_data=None):
+    def chat(self, user_query, char_name, char_data, current_arc_context, history=None, all_characters_data=None, full_timeline_data=None, selected_arc_id=None):
         turn_start = time.time()
 
         if not self.retriever:
@@ -162,9 +150,17 @@ class ChatController:
         history = history or []
         context_text, context_facts = self.get_context(user_query)
         
+        # --- FILTER TIMELINE (Prevent Future Leaks) ---
+        past_events = []
+        if full_timeline_data and selected_arc_id:
+            valid_events = [arc for arc in full_timeline_data if arc.get('arc_id', 999) <= selected_arc_id]
+            past_events = [f"- Arc {e.get('arc_id')}: {e.get('summary')}" for e in valid_events]
+        
+        timeline_context = "\n".join(past_events)
+
         # --- 1. AUDITOR MODE ---
         if char_name == "The_Auditor" or char_data.get("role") == "auditor":
-            result = self._run_auditor(user_query, context_text, context_facts)
+            result = self._run_auditor(user_query, context_text, context_facts, timeline_context)
         
         # --- 2. CHARACTER MODE ---
         else:
@@ -173,7 +169,6 @@ class ChatController:
                 context_text, current_arc_context, history
             )
 
-        # --- LOGGING & METRICS ---
         latency = time.time() - turn_start
         response_text = result.get("response") or result.get("answer") or "..."
         book_name = os.path.basename(self.current_book_path) if self.current_book_path else "Unknown"
@@ -186,17 +181,22 @@ class ChatController:
             user_query=user_query,
             bot_response=response_text,
             latency=latency,
-            context_len=len(context_text)
+            context_len=len(context_text),
+            arc_id=selected_arc_id  # <--- LOGGING THE ARC ID
         )
 
         return result
 
-    def _run_auditor(self, query, text, facts):
-        logger.info("🕵️ Running Auditor Logic...")
+    def _run_auditor(self, query, text, facts, timeline_history):
+        logger.info("🕵️ Running Auditor Logic with Timeline Filter...")
         
         system_prompt = """You are The Auditor, an objective AI fact-checker.
-        Use the provided CONTEXT and FACTS to answer accurately.
-        If the information is not in the context, say so. Do not hallucinate.
+        You observe the story as it unfolds.
+        
+        CRITICAL RULES:
+        1. You only know what has happened in the "KNOWN HISTORY" provided below.
+        2. Do NOT use outside knowledge of the book. If an event is not in the history or context, it hasn't happened yet.
+        3. Answer factually.
         
         Output format (JSON):
         {
@@ -207,9 +207,16 @@ class ChatController:
         """
 
         user_input = f"""
-        CONTEXT_TEXT: {text}
-        CONTEXT_FACTS: {facts}
-        USER_QUESTION: {query}
+        KNOWN HISTORY (Chronological Order):
+        {timeline_history}
+
+        RELEVANT TEXT EXCERPTS:
+        {text}
+        
+        RELEVANT FACTS:
+        {facts}
+        
+        USER QUESTION: {query}
         """
 
         try:
