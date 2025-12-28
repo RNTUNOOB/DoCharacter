@@ -4,6 +4,7 @@ import json
 import logging
 import asyncio
 import time
+import re
 from collections import Counter
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
@@ -25,7 +26,6 @@ INGEST_LOG_FILE = "ingest_logs.log"
 # --- LOGGING SETUP ---
 logger = logging.getLogger("IngestPipeline")
 logger.setLevel(logging.INFO)
-# Clear existing handlers to prevent duplicates on reload
 if logger.hasHandlers():
     logger.handlers.clear()
 
@@ -74,45 +74,90 @@ def load_document(path):
     logger.info(f"✅ Loaded {len(clean_text)} characters in {time.time() - start_ts:.2f}s")
     return clean_text
 
-# --- 2. AI WORKERS ---
+# --- 2. HIERARCHICAL STRUCTURE ANALYSIS (THE NEW BRAIN) ---
 
-async def analyze_timeline_chunk(llm, chunk, index):
-    """Summarizes a chunk and extracts characters present in that chunk."""
+async def detect_structure(llm, text_preview):
+    """
+    Asks LLM to guess the best segmentation strategy based on the first 20k chars.
+    It decides if the book has "Parts", "Chapters", or just "Scenes".
+    """
+    prompt = """
+    Analyze the beginning of this book. Detect its structural hierarchy.
+    Does it use "BOOK I", "PART 1", "CHAPTER 1", or just breaks?
+    
+    Return JSON:
+    {
+        "structure_type": "complex" OR "simple",
+        "primary_separator": "Regex pattern to split by (e.g., 'CHAPTER \\d+') or 'none'",
+        "estimated_depth": 1 or 2
+    }
+    """
+    try:
+        response = await llm.ainvoke([
+            SystemMessage(content=prompt),
+            HumanMessage(content=f"TEXT START:\n{text_preview[:15000]}")
+        ])
+        config = json.loads(response.content)
+        logger.info(f"🏗️  Detected Structure: {config}")
+        return config
+    except Exception as e:
+        logger.warning(f"⚠️ Structure detection failed, defaulting to sliding window: {e}")
+        return {"structure_type": "simple", "primary_separator": "none"}
+
+def split_by_separator(text, separator):
+    """Splits text based on LLM-suggested regex."""
+    if separator == "none" or not separator:
+        return [text]
+    
+    try:
+        # Compile regex with ignore case
+        pattern = re.compile(separator, re.IGNORECASE)
+        parts = pattern.split(text)
+        # Filter empty strings
+        return [p for p in parts if len(p) > 500]
+    except:
+        return [text]
+
+# --- 3. STANDARD AI WORKERS ---
+
+async def analyze_timeline_chunk(llm, chunk, index, hierarchy_label=""):
+    """Summarizes a chunk and extracts characters."""
     prompt = """
     Analyze this story segment.
     Return JSON:
     {
         "summary": "One sentence summary of events.",
-        "characters_present": ["List of EXACT names of characters appearing here"],
+        "characters_present": ["List of EXACT names"],
         "moods": [{"char": "Name", "emotion": "Emotion"}]
     }
     """
     try:
         res = await llm.ainvoke([
             SystemMessage(content=prompt),
-            HumanMessage(content=f"TEXT:\n{chunk[:6000]}") # limit chunk context for speed
+            HumanMessage(content=f"CONTEXT: {hierarchy_label}\nTEXT:\n{chunk[:6000]}")
         ])
         data = json.loads(res.content)
         data['arc_id'] = index
+        data['section'] = hierarchy_label # Store the section name (e.g., "Chapter 5")
         return data
     except Exception as e:
         logger.warning(f"⚠️ Timeline Chunk {index} failed: {e}")
         return None
 
 async def generate_bio_from_history(llm, name, arc_summaries):
-    """Creates a bio based on what the character actually DID in the timeline."""
+    """Creates a bio based on history."""
     context = "\n".join(arc_summaries)
     prompt = f"""
-    Based on the following story events, write a character profile for "{name}".
+    Based on the following events, write a profile for "{name}".
     EVENTS:
     {context}
     
     Return JSON:
     {{
-        "bio": "2 sentence bio based on these events.",
+        "bio": "2 sentence bio.",
         "personality": "One word archetype.",
         "role": "Protagonist, Antagonist, or Support",
-        "speaking_style": "Describe how they speak (e.g. Formal, Rude)",
+        "speaking_style": "Describe how they speak",
         "sample_quotes": []
     }}
     """
@@ -120,103 +165,110 @@ async def generate_bio_from_history(llm, name, arc_summaries):
         res = await llm.ainvoke([SystemMessage(content=prompt)])
         return json.loads(res.content)
     except:
-        return {
-            "bio": "A mysterious figure mentioned in the story.", 
-            "personality": "Unknown", 
-            "role": "Support",
-            "speaking_style": "Normal",
-            "sample_quotes": []
-        }
+        return {"bio": "Unknown", "personality": "Unknown", "role": "Support", "speaking_style": "Normal", "sample_quotes": []}
 
 def clean_name_for_dedup(name):
-    """Standardizes names for comparison (e.g. 'The White Rabbit' -> 'white rabbit')"""
     return name.lower().replace("the ", "").strip()
 
-async def build_timeline_and_extract_cast(text):
+async def build_hierarchical_timeline(text):
     """
-    1. Builds timeline from WHOLE book.
-    2. Aggregates characters found in timeline.
-    3. SMART MERGE: Deduplicates names (White Rabbit == The White Rabbit).
-    4. Generates profiles for top characters.
+    Smart Orchestrator:
+    1. Detects Structure.
+    2. Splits accordingly (by Chapter/Part if possible, else Sliding Window).
+    3. Processes chunks.
     """
-    logger.info("⏳ Starting Deep Scan (Timeline + Cast Extraction)...")
-    
-    # 1. Split Book
-    splitter = RecursiveCharacterTextSplitter(chunk_size=8000, chunk_overlap=500)
-    chunks = splitter.split_text(text)
-    logger.info(f"📘 Split book into {len(chunks)} segments.")
+    logger.info("⏳ Starting Hierarchical Deep Scan...")
     
     llm = ChatOllama(model=LLM_MODEL, format="json", temperature=0.1, num_ctx=8192)
     
-    # 2. Build Timeline
-    timeline = []
-    char_appearances = [] # List of (Name, Arc_Summary) tuples
+    # 1. Detect Structure
+    structure = await detect_structure(llm, text)
     
-    # Banned words to prevent pronouns from becoming characters
+    chunks = []
+    labels = []
+    
+    # 2. Smart Splitting
+    if structure.get("structure_type") == "complex" and structure.get("primary_separator") != "none":
+        logger.info(f"✂️  Splitting by regex: {structure['primary_separator']}")
+        raw_sections = split_by_separator(text, structure['primary_separator'])
+        logger.info(f"   Found {len(raw_sections)} distinct sections.")
+        
+        # If sections are huge, sub-split them
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=8000, chunk_overlap=500)
+        
+        for i, section in enumerate(raw_sections):
+            if len(section) < 500: continue # skip noise
+            
+            section_label = f"Section {i+1}"
+            sub_chunks = text_splitter.split_text(section)
+            for sub in sub_chunks:
+                chunks.append(sub)
+                labels.append(section_label)
+                
+    else:
+        # Fallback to standard sliding window
+        logger.info("✂️  Using Standard Sliding Window (8000 chars).")
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=8000, chunk_overlap=500)
+        chunks = text_splitter.split_text(text)
+        labels = [f"Part {i+1}" for i in range(len(chunks))]
+
+    logger.info(f"📘 Processing {len(chunks)} total segments.")
+
+    # 3. Process Timeline
+    timeline = []
+    char_appearances = [] 
     BANNED_NAMES = {"he", "she", "it", "they", "him", "her", "them", "who", "i", "you"}
 
     start_time = time.time()
     for i, chunk in enumerate(chunks):
-        logger.info(f"   🔹 Analyzing Segment {i+1}/{len(chunks)}...")
-        result = await analyze_timeline_chunk(llm, chunk, i+1)
+        logger.info(f"   🔹 Analyzing {labels[i]} ({i+1}/{len(chunks)})...")
+        # Pass the label (Chapter name) to the LLM for better context
+        result = await analyze_timeline_chunk(llm, chunk, i+1, labels[i])
         if result:
             timeline.append(result)
             for name in result.get("characters_present", []):
                 clean = name.strip()
-                # FIX: Removed the (" " in clean) check that killed Alice
                 if len(clean) > 2 and clean.lower() not in BANNED_NAMES:
                     char_appearances.append((clean, result.get("summary", "")))
     
     logger.info(f"✅ Timeline built in {time.time() - start_time:.2f}s")
 
-    # 3. Smart Deduplication
-    logger.info("👥 Consolidating & Merging Cast List...")
-    
-    # Sort by length desc so we match "Queen of Hearts" before "Queen"
+    # 4. Deduplication & Profiling (Same as before)
+    logger.info("👥 Consolidating Cast List...")
     unique_names = list(set([c[0] for c in char_appearances]))
     unique_names.sort(key=len, reverse=True)
     
-    canonical_map = {} # {'The Queen': 'Queen of Hearts', 'Queen': 'Queen of Hearts'}
-    final_cast_events = {} # {'Queen of Hearts': [summaries...]}
+    canonical_map = {} 
+    final_cast_events = {} 
 
     for name in unique_names:
         normalized = clean_name_for_dedup(name)
         match_found = False
-        
-        # Check against existing canonical names
         for canonical in final_cast_events.keys():
             canonical_norm = clean_name_for_dedup(canonical)
-            # Logic: If "Queen" is in "Queen of Hearts" OR "White Rabbit" == "white rabbit"
             if normalized in canonical_norm or canonical_norm in normalized:
                 canonical_map[name] = canonical
                 match_found = True
                 break
-        
         if not match_found:
             final_cast_events[name] = []
             canonical_map[name] = name
 
-    # Aggregate stories into the canonical buckets
     for raw_name, summary in char_appearances:
         if raw_name in canonical_map:
-            root_name = canonical_map[raw_name]
-            final_cast_events[root_name].append(summary)
+            final_cast_events[canonical_map[raw_name]].append(summary)
 
-    # Filter for characters mentioned in at least 2 chunks (noise filter)
-    # Exception: If the cast is very small, allow everyone.
     min_mentions = 2 if len(final_cast_events) > 10 else 1
     major_chars = {k: v for k, v in final_cast_events.items() if len(v) >= min_mentions}
     
-    # 4. Generate Profiles
     final_profiles = {}
-    logger.info(f"✍️ Generating profiles for {len(major_chars)} unique characters...")
+    logger.info(f"✍️ Generating profiles for {len(major_chars)} characters...")
     
     for name, summaries in major_chars.items():
         logger.info(f"   Profiling: {name}")
         profile = await generate_bio_from_history(llm, name, summaries[:10]) 
         final_profiles[name] = profile
 
-    # Add Auditor
     final_profiles["The_Auditor"] = {
         "role": "auditor",
         "bio": "An impartial AI fact-checker.",
@@ -231,19 +283,14 @@ async def build_timeline_and_extract_cast(text):
 def create_vector_db(text, save_path):
     start_ts = time.time()
     logger.info("🧠 Vectorizing text (CPU)...")
-    
     if os.path.exists(save_path):
         shutil.rmtree(save_path)
-        
     embeddings = HuggingFaceEmbeddings(
         model_name=EMBED_MODEL_ID,
         model_kwargs={'device': 'cpu', 'trust_remote_code': True}
     )
-    
     splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200)
     docs = splitter.create_documents([text])
-    
-    # Batch processing
     batch_size = 100
     for i in range(0, len(docs), batch_size):
         batch = docs[i:i+batch_size]
@@ -254,7 +301,6 @@ def create_vector_db(text, save_path):
             db.add_documents(batch)
         if i % 500 == 0:
             logger.info(f"   Encoded {i}/{len(docs)} chunks...")
-            
     logger.info(f"✅ Vector DB finished in {time.time() - start_ts:.2f}s")
 
 # --- 4. ORCHESTRATOR ---
@@ -271,8 +317,8 @@ async def run_pipeline(file_obj, book_title):
         
     text = load_document(file_path)
     
-    # Unified Step: Build Timeline AND Extract Characters from it
-    timeline_data, char_data = await build_timeline_and_extract_cast(text)
+    # Calls the new Hierarchical Builder
+    timeline_data, char_data = await build_hierarchical_timeline(text)
     
     with open(os.path.join(base_dir, "timeline.json"), "w") as f:
         json.dump(timeline_data, f, indent=4)

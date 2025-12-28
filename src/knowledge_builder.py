@@ -7,7 +7,7 @@ from langchain_ollama import ChatOllama
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.messages import SystemMessage, HumanMessage
 
-# Reuse the loader from your pipeline (or copy the function if you prefer decoupling)
+# Reuse the loader from your pipeline to ensure consistency
 from ingest_pipeline import load_document 
 
 # --- CONFIGURATION ---
@@ -17,14 +17,17 @@ LOG_FILE = "knowledge_builder.log"
 # --- LOGGING ---
 logger = logging.getLogger("KnowledgeBuilder")
 logger.setLevel(logging.INFO)
-if not logger.handlers:
-    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-    sh = logging.StreamHandler()
-    sh.setFormatter(formatter)
-    logger.addHandler(sh)
-    fh = logging.FileHandler(LOG_FILE, encoding='utf-8')
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
+# Clear existing handlers to avoid duplicates
+if logger.hasHandlers():
+    logger.handlers.clear()
+
+formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+sh = logging.StreamHandler()
+sh.setFormatter(formatter)
+logger.addHandler(sh)
+fh = logging.FileHandler(LOG_FILE, encoding='utf-8')
+fh.setFormatter(formatter)
+logger.addHandler(fh)
 
 async def extract_facts_from_chunk(llm, chunk, chunk_id):
     """
@@ -76,10 +79,10 @@ async def run_knowledge_mining(book_path):
     chunks = splitter.split_text(text)
     logger.info(f"📘 Split text into {len(chunks)} segments for mining.")
     
-    # 3. Initialize LLM
+    # 3. Initialize LLM (Temperature 0 for strict facts)
     llm = ChatOllama(model=LLM_MODEL, format="json", temperature=0.0, num_ctx=8192)
     
-    # 4. Process Chunks (Sequential to save VRAM, or semi-parallel)
+    # 4. Process Chunks (Sequential to save VRAM)
     all_facts = []
     start_time = time.time()
     
@@ -93,7 +96,6 @@ async def run_knowledge_mining(book_path):
     # 5. Save to knowledge.json
     kb_path = os.path.join(book_path, "knowledge.json")
     
-    # If file exists and isn't empty, maybe we merge? For now, we overwrite.
     with open(kb_path, "w", encoding='utf-8') as f:
         json.dump(all_facts, f, indent=4)
         
@@ -110,7 +112,6 @@ def mine_knowledge_graph(book_path):
     return loop.run_until_complete(run_knowledge_mining(book_path))
 
 if __name__ == "__main__":
-    # Test run via CLI
     import sys
     if len(sys.argv) > 1:
         mine_knowledge_graph(sys.argv[1])

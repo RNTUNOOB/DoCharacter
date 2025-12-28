@@ -35,10 +35,6 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("chromadb").setLevel(logging.ERROR)
 
 def log_conversation_turn(book, char, user_query, bot_response, latency, context_len, arc_id=None):
-    """
-    Appends a structured JSON log entry for replayability and analysis.
-    Now includes 'arc_id' to track narrative progression.
-    """
     entry = {
         "timestamp": datetime.datetime.now().isoformat(),
         "book": book,
@@ -150,11 +146,12 @@ class ChatController:
         history = history or []
         context_text, context_facts = self.get_context(user_query)
         
-        # --- FILTER TIMELINE (Prevent Future Leaks) ---
+        # --- FILTER TIMELINE ---
         past_events = []
         if full_timeline_data and selected_arc_id:
             valid_events = [arc for arc in full_timeline_data if arc.get('arc_id', 999) <= selected_arc_id]
-            past_events = [f"- Arc {e.get('arc_id')}: {e.get('summary')}" for e in valid_events]
+            # Include Section Headers in summary for better context
+            past_events = [f"[{e.get('section', 'General')}] {e.get('summary')}" for e in valid_events]
         
         timeline_context = "\n".join(past_events)
 
@@ -182,7 +179,7 @@ class ChatController:
             bot_response=response_text,
             latency=latency,
             context_len=len(context_text),
-            arc_id=selected_arc_id  # <--- LOGGING THE ARC ID
+            arc_id=selected_arc_id
         )
 
         return result
