@@ -1,248 +1,293 @@
 import os
-import logging
 import json
+import logging
+import time
+import datetime
+import gc
 import networkx as nx
 from langchain_chroma import Chroma
-from langchain_ollama import OllamaLLM
-from langchain_core.prompts import PromptTemplate
+from langchain_ollama import ChatOllama
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.messages import SystemMessage, HumanMessage
 
 # --- CONFIGURATION ---
+LLM_MODEL = "llama3.1" 
 EMBED_MODEL_ID = "nomic-ai/nomic-embed-text-v1.5"
-LLM_MODEL = "llama3.1"
 LOG_FILE = "chat_logs.log"
+CHAT_HISTORY_FILE = "conversation_history.jsonl"
 
 # --- LOGGING SETUP ---
 logger = logging.getLogger("ChatEngine")
 logger.setLevel(logging.INFO)
 
-if not logger.handlers:
-    file_handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
-    file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
-    logger.addHandler(file_handler)
+if logger.hasHandlers():
+    logger.handlers.clear()
 
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
-    logger.addHandler(stream_handler)
+formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+fh = logging.FileHandler(LOG_FILE, encoding='utf-8')
+fh.setFormatter(formatter)
+logger.addHandler(fh)
+sh = logging.StreamHandler()
+sh.setFormatter(formatter)
+logger.addHandler(sh)
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-logging.getLogger("chromadb").setLevel(logging.WARNING)
-# ---------------------
+logging.getLogger("chromadb").setLevel(logging.ERROR)
+
+def log_conversation_turn(book, char, user_query, bot_response, latency, context_len, arc_id=None):
+    """
+    Appends a structured JSON log entry for replayability and analysis.
+    Now includes 'arc_id' to track narrative progression.
+    """
+    entry = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "book": book,
+        "character": char,
+        "arc_id": arc_id,
+        "latency_sec": round(latency, 2),
+        "context_chars": context_len,
+        "user_query": user_query,
+        "bot_response": bot_response
+    }
+    try:
+        with open(CHAT_HISTORY_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        logger.error(f"Failed to write chat history: {e}")
 
 class ChatController:
     def __init__(self):
-        print("⚡ Initializing AI Models...")
+        logger.info(f"⚡ Initializing Chat Engine with {LLM_MODEL}...")
+        
         self.embeddings = HuggingFaceEmbeddings(
             model_name=EMBED_MODEL_ID,
             model_kwargs={'device': 'cpu', 'trust_remote_code': True}
         )
-        self.llm = OllamaLLM(model=LLM_MODEL, temperature=0.7)
-        self.fact_llm = OllamaLLM(model=LLM_MODEL, temperature=0.1)
-        
+
+        self.llm_creative = ChatOllama(
+            model=LLM_MODEL,
+            temperature=0.75,
+            num_ctx=8192,
+            format="json"
+        )
+
+        self.llm_strict = ChatOllama(
+            model=LLM_MODEL,
+            temperature=0.1,
+            num_ctx=8192,
+            format="json"
+        )
+
         self.vector_store = None
         self.retriever = None
-        self.graph = None 
-        self.current_book_path = None
         self.knowledge_base = []
+        self.current_book_path = None
 
     def load_book_resources(self, book_path):
-        if self.current_book_path == book_path and self.vector_store is not None:
+        if self.current_book_path == book_path and self.vector_store:
             return
 
+        start_ts = time.time()
+        logger.info(f"📚 Loading resources from: {book_path}")
         db_path = os.path.join(book_path, "vector_db")
-        if not os.path.exists(db_path):
-            raise FileNotFoundError(f"Vector DB missing at {db_path}")
-
-        print(f"📚 Switching Context to: {book_path}")
-        self.vector_store = Chroma(persist_directory=db_path, embedding_function=self.embeddings)
-        self.retriever = self.vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 4}) 
         
-        graph_path = os.path.join(book_path, "relationships.graphml")
-        if os.path.exists(graph_path):
-            try:
-                self.graph = nx.read_graphml(graph_path)
-                print("🕸️ Social Graph Loaded.")
-            except: self.graph = None
-        else: self.graph = None
+        if not os.path.exists(db_path):
+            raise FileNotFoundError(f"Vector DB not found at {db_path}")
 
-        # NEW: Load Knowledge Base (GraphRAG Facts)
+        try:
+            self.vector_store = Chroma(
+                persist_directory=db_path, 
+                embedding_function=self.embeddings
+            )
+            self.retriever = self.vector_store.as_retriever(
+                search_type="mmr",
+                search_kwargs={"k": 5, "fetch_k": 10}
+            )
+            logger.info(f"✅ Resources loaded in {time.time() - start_ts:.2f}s")
+        except Exception as e:
+            logger.error(f"Failed to load Vector DB: {e}")
+            self.vector_store = None
+
         kb_path = os.path.join(book_path, "knowledge.json")
         if os.path.exists(kb_path):
-            with open(kb_path, 'r') as f:
-                self.knowledge_base = json.load(f)
-        else:
-            self.knowledge_base = []
-
+            try:
+                with open(kb_path, 'r', encoding='utf-8') as f:
+                    self.knowledge_base = json.load(f)
+            except:
+                self.knowledge_base = []
+        
         self.current_book_path = book_path
 
-    def get_social_context(self, char_name):
-        if not self.graph or not self.graph.has_node(char_name): return "No known relationships."
-        rels = []
-        for neighbor in self.graph.neighbors(char_name):
-            edge = self.graph.get_edge_data(char_name, neighbor)
-            rels.append(f"- {edge.get('relation', 'knows')} {neighbor}")
-        return "\n".join(rels) if rels else "No close contacts."
+    def unload_resources(self):
+        logger.info("🔓 Unloading resources and releasing DB locks...")
+        self.vector_store = None
+        self.retriever = None
+        self.knowledge_base = []
+        self.current_book_path = None
+        gc.collect()
 
-    def get_relevant_context(self, query):
-        if not self.retriever: return "No book selected."
-        docs = self.retriever.invoke(query)
-        return "\n\n".join([doc.page_content for doc in docs])
+    def get_context(self, query):
+        text_context = ""
+        if self.retriever:
+            docs = self.retriever.invoke(query)
+            text_context = "\n---\n".join([d.page_content for d in docs])
 
-    # --- STRATEGY 1: DOSSIER INJECTION ---
-    def get_referenced_char_profiles(self, query, all_characters_data):
-        """If the user mentions 'O'Brien', fetch O'Brien's bio."""
-        profiles = []
-        query_lower = query.lower()
+        facts = []
+        q_terms = query.lower().split()
+        for entry in self.knowledge_base[:500]: 
+            if any(term in str(entry.get('subject', '')).lower() for term in q_terms):
+                facts.append(f"{entry.get('subject')} {entry.get('predicate')} {entry.get('object')}")
         
-        for name, data in all_characters_data.items():
-            if name.lower() in query_lower or query_lower in name.lower():
-                profile = f"--- CHARACTER DOSSIER: {name} ---\nBio: {data.get('bio')}\nSecrets: {data.get('secrets')}\n"
-                profiles.append(profile)
+        fact_context = "\n".join(facts[:10])
+        return text_context, fact_context
+
+    def chat(self, user_query, char_name, char_data, current_arc_context, history=None, all_characters_data=None, full_timeline_data=None, selected_arc_id=None):
+        turn_start = time.time()
+
+        if not self.retriever:
+            return {"response": "Please select a book first.", "tone": "System"}
+
+        history = history or []
+        context_text, context_facts = self.get_context(user_query)
         
-        return "\n".join(profiles)
-
-    # --- STRATEGY 2: SYNOPSIS INJECTION ---
-    def get_full_timeline_summary(self, full_timeline):
-        """Condenses the entire book timeline into a short summary list."""
-        if not full_timeline: return "No timeline available."
-        summary = []
-        for event in full_timeline:
-            summary.append(f"Arc {event.get('arc_id')}: {event.get('summary')}")
-        return "\n".join(summary)
-
-    # --- STRATEGY 3: SEMANTIC FACT LOOKUP (GraphRAG) ---
-    def get_relevant_facts(self, query):
-        """Simple keyword/semantic filter for the knowledge base."""
-        query_words = set(query.lower().split())
-        hits = []
-        for fact in self.knowledge_base:
-            # Check matches in Subject or Object
-            s, o = fact.get('subject', '').lower(), fact.get('object', '').lower()
-            if any(w in s for w in query_words) or any(w in o for w in query_words):
-                hits.append(f"- {fact['subject']} {fact['predicate']} {fact['object']} ({fact['context']})")
-        return "\n".join(hits[:12]) # Top 12 relevant facts
-
-    def chat(self, user_query, char_name, char_data, current_arc_context, 
-             history=[], all_characters_data={}, full_timeline_data=[]): 
+        # --- FILTER TIMELINE (Prevent Future Leaks) ---
+        past_events = []
+        if full_timeline_data and selected_arc_id:
+            valid_events = [arc for arc in full_timeline_data if arc.get('arc_id', 999) <= selected_arc_id]
+            past_events = [f"- Arc {e.get('arc_id')}: {e.get('summary')}" for e in valid_events]
         
-        if not self.retriever: return "Please select a book first."
+        timeline_context = "\n".join(past_events)
 
-        # 1. Retrieval (Vector + Graph)
-        text_context = self.get_relevant_context(user_query)
-        fact_context = self.get_relevant_facts(user_query) # <--- NEW
+        # --- 1. AUDITOR MODE ---
+        if char_name == "The_Auditor" or char_data.get("role") == "auditor":
+            result = self._run_auditor(user_query, context_text, context_facts, timeline_context)
         
-        # 2. Strategy 1: Referenced characters
-        relevant_dossiers = self.get_referenced_char_profiles(user_query, all_characters_data)
-        
-        # 3. Strategy 2: Full Timeline
-        full_book_summary = self.get_full_timeline_summary(full_timeline_data)
-
-        # 4. Format History
-        formatted_history = "\n".join([f"{m['role'].title()}: {m['content']}" for m in history[-5:]])
-
-        logger.info(f"--- TURN: {char_name} | Query: {user_query} ---")
-
-        # --- MODE A: AUDITOR ---
-        if char_name == "The_Auditor":
-            prompt = PromptTemplate.from_template("""
-            You are 'The Auditor', an external AI analyst reviewing a book.
-            
-            VERIFIED FACTS (Knowledge Graph):
-            {facts}
-            
-            GLOBAL PLOT SUMMARY (Timeline):
-            {full_book_summary}
-            
-            RELEVANT CHARACTER DOSSIERS:
-            {dossiers}
-            
-            SPECIFIC TEXT EXCERPTS (Narrative):
-            {context}
-            
-            USER QUESTION: {query}
-            
-            INSTRUCTIONS:
-            1. Combine the verified facts, plot summary, and text excerpts to answer.
-            2. If the user asks about a character's fate (e.g., "What happened to X?"), prioritize the Facts and Dossiers.
-            3. Be factual and objective.
-            
-            ANSWER:
-            """)
-            chain = prompt | self.fact_llm
-            final_response = chain.invoke({
-                "context": text_context,
-                "facts": fact_context, 
-                "full_book_summary": full_book_summary,
-                "dossiers": relevant_dossiers,
-                "query": user_query
-            })
-
-        # --- MODE B: PERSONA ---
+        # --- 2. CHARACTER MODE ---
         else:
-            social_context = self.get_social_context(char_name)
+            result = self._run_character(
+                user_query, char_name, char_data, 
+                context_text, current_arc_context, history
+            )
 
-            # Inner Monologue
-            thought_prompt = PromptTemplate.from_template("""
-            You are {name}. Bio: {bio}. Personality: {personality}.
-            
-            SITUATION:
-            - Talking to a Stranger (User).
-            - User said: "{query}"
-            
-            YOUR KNOWLEDGE:
-            - Verified Facts: {facts}
-            - Narrative Memory: {context}
-            - Relevant Dossiers: {dossiers}
-            
-            TASK: Think silently about the user's input. 
-            Do NOT confuse the User with characters from your memories.
-            Output ONLY the thought.
-            """)
-            
-            thought_chain = thought_prompt | self.llm
-            inner_monologue = thought_chain.invoke({
-                "name": char_name,
-                "bio": char_data['bio'],
-                "personality": char_data['personality'],
-                "facts": fact_context,
-                "dossiers": relevant_dossiers,
-                "query": user_query,
-                "context": text_context
-            })
-            log_thought = inner_monologue
+        latency = time.time() - turn_start
+        response_text = result.get("response") or result.get("answer") or "..."
+        book_name = os.path.basename(self.current_book_path) if self.current_book_path else "Unknown"
 
-            # External Speech
-            samples = "\n".join([f'- "{s}"' for s in char_data.get('sample_quotes', [])])
-            
-            speech_prompt = PromptTemplate.from_template("""
-            You are {name}. Voice Style: {style}.
-            
-            VOICE SAMPLES:
-            {samples}
-            
-            CHAT HISTORY:
-            {chat_history}
-            
-            CONTEXT:
-            User: "{query}"
-            Your Thought: {thought}
-            Memory: {context}
-            
-            Respond naturally.
-            """)
-            
-            speech_chain = speech_prompt | self.llm
-            final_response = speech_chain.invoke({
-                "name": char_name,
-                "style": char_data['speaking_style'],
-                "samples": samples,
-                "chat_history": formatted_history,
-                "context": text_context,
-                "query": user_query,
-                "thought": inner_monologue
-            })
+        logger.info(f"🗣️ {char_name} replied in {latency:.2f}s (Context: {len(context_text)} chars)")
+        
+        log_conversation_turn(
+            book=book_name,
+            char=char_name,
+            user_query=user_query,
+            bot_response=response_text,
+            latency=latency,
+            context_len=len(context_text),
+            arc_id=selected_arc_id  # <--- LOGGING THE ARC ID
+        )
 
-        logger.info(f"🧠 THOUGHT: {log_thought}")
-        logger.info(f"🗣️ RESPONSE: {final_response}")
-        return final_response
+        return result
+
+    def _run_auditor(self, query, text, facts, timeline_history):
+        logger.info("🕵️ Running Auditor Logic with Timeline Filter...")
+        
+        system_prompt = """You are The Auditor, an objective AI fact-checker.
+        You observe the story as it unfolds.
+        
+        CRITICAL RULES:
+        1. You only know what has happened in the "KNOWN HISTORY" provided below.
+        2. Do NOT use outside knowledge of the book. If an event is not in the history or context, it hasn't happened yet.
+        3. Answer factually.
+        
+        Output format (JSON):
+        {
+            "answer": "The factual answer...",
+            "confidence": 0.0 to 1.0,
+            "sources": ["List of specific quotes used"]
+        }
+        """
+
+        user_input = f"""
+        KNOWN HISTORY (Chronological Order):
+        {timeline_history}
+
+        RELEVANT TEXT EXCERPTS:
+        {text}
+        
+        RELEVANT FACTS:
+        {facts}
+        
+        USER QUESTION: {query}
+        """
+
+        try:
+            response = self.llm_strict.invoke(
+                [SystemMessage(content=system_prompt), HumanMessage(content=user_input)]
+            )
+            return json.loads(response.content)
+        except Exception as e:
+            logger.error(f"Auditor Error: {e}")
+            return {"answer": "Error analyzing data.", "confidence": 0.0, "sources": []}
+
+    def _run_character(self, query, name, data, text_context, arc_context, history):
+        logger.info(f"🎭 Running Character Logic for {name}...")
+
+        bio = data.get('bio', 'Unknown')
+        personality = data.get('personality', 'Neutral')
+        style = data.get('speaking_style', 'Standard')
+        quotes = data.get('sample_quotes', [])
+        
+        chat_log = []
+        for msg in history[-5:]:
+            role = msg.get('role')
+            content = msg.get('content')
+            if isinstance(content, dict): 
+                content = content.get('response', '')
+            chat_log.append(f"{role.upper()}: {content}")
+        history_str = "\n".join(chat_log)
+
+        system_prompt = f"""You are {name}.
+        BIO: {bio}
+        PERSONALITY: {personality}
+        SPEAKING STYLE: {style}
+        SAMPLE QUOTES: {json.dumps(quotes)}
+        
+        CURRENT SCENE MOOD: {arc_context}
+        
+        INSTRUCTIONS:
+        1. Read the Context and User Query.
+        2. Formulate an internal thought.
+        3. Reply to the user in character. 
+        4. STAY IN CHARACTER.
+        
+        Output format (JSON):
+        {{
+            "internal_thought": {{
+                "analysis": "...",
+                "strategy": "..."
+            }},
+            "response": "Your spoken reply...",
+            "tone": "Emotion",
+            "sources": []
+        }}
+        """
+
+        user_input = f"""
+        BOOK_CONTEXT: {text_context}
+        CONVERSATION_HISTORY:
+        {history_str}
+        
+        USER_SAYS: {query}
+        """
+
+        try:
+            response = self.llm_creative.invoke(
+                [SystemMessage(content=system_prompt), HumanMessage(content=user_input)]
+            )
+            return json.loads(response.content)
+        except Exception as e:
+            logger.error(f"Character Error: {e}")
+            return {
+                "response": "...", 
+                "tone": "Confused", 
+                "internal_thought": {"analysis": "Error", "strategy": "Fallback"}
+            }
