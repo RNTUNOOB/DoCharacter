@@ -1,0 +1,20 @@
+[
+    {
+        "subject": "Arthur Pendelton",
+        "predicate": "lived",
+        "object": "a small cottage nestled beside the River Wye",
+        "source_chunk": 0
+    },
+    {
+        "subject": "Beatrice Plum",
+        "predicate": "visited",
+        "object": "Arthur daily to share the morning news",
+        "source_chunk": 0
+    },
+    {
+        "subject": "Bartholomew (the badger)",
+        "predicate": "polished",
+        "object": "The Great Steep teapot with a small handkerchief",
+        "source_chunk": 0
+    }
+]

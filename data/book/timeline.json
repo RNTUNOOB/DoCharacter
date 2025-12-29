@@ -1,0 +1,26 @@
+[
+    {
+        "summary": "Arthur's prized teapot 'The Great Steep' goes missing, but it's actually his pet badger Bartholomew who is responsible.",
+        "characters_present": [
+            "Professor Arthur Pendelton",
+            "Mrs. Beatrice Plum",
+            "Bartholomew the badger"
+        ],
+        "moods": [
+            {
+                "char": "Arthur Pendelton",
+                "emotion": "frustration"
+            },
+            {
+                "char": "Beatrice Plum",
+                "emotion": "calmness"
+            },
+            {
+                "char": "Bartholomew the badger",
+                "emotion": "sadness"
+            }
+        ],
+        "arc_id": 1,
+        "section": "Section 1"
+    }
+]
