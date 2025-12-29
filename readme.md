@@ -4,6 +4,8 @@
 #########################################################
 #########################################################
 
+UI Review available at https://docharacter-preview.streamlit.app/
+
 DoDocument is a role-playing bot. It uses local model to run multiple characters extracted from the book provided. 
 
 System config used during development:
