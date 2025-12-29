@@ -188,6 +188,7 @@ with st.sidebar:
 
 # --- LOAD RESOURCES ---
 if not selected_book_name:
+    st.markdown("<div style='margin-top: 2rem;'></div>", unsafe_allow_html=True)
     st.info("👈 Upload a book to get started.")
     st.stop()
 
