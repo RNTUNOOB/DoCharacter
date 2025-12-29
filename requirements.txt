@@ -1,17 +1,2 @@
-langchain
-langchain-text-splitters
-langchain-community
-langchain-chroma
-langchain-ollama
 streamlit
-pypdf
-chromadb
-networkx
-spacy
-ebooklib 
-beautifulsoup4
-pydantic
-langchain-huggingface 
-sentence-transformers
-einops
 graphviz
