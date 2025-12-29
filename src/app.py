@@ -11,7 +11,7 @@ from knowledge_builder import mine_knowledge_graph
 DATA_DIR = "data"
 
 st.set_page_config(
-    page_title="DOCharacter",
+    page_title="DoCharacter",
     layout="wide",
     page_icon="📚",
     initial_sidebar_state="expanded",
@@ -202,7 +202,7 @@ if os.path.exists(char_file):
     try:
         with open(char_file, "r") as f:
             characters = json.load(f)
-    except:
+    except Exception:
         pass
 
 timeline_data = []
@@ -210,7 +210,7 @@ if os.path.exists(timeline_path):
     try:
         with open(timeline_path, "r") as f:
             timeline_data = json.load(f)
-    except:
+    except Exception:
         pass
 
 try:
@@ -455,6 +455,7 @@ with tab_chat:
                             full_timeline_data=timeline_data,
                             selected_arc_id=selected_arc_idx,
                         )
+                        print(response_data)
 
                         if "response" in response_data:
                             st.markdown(response_data["response"])
@@ -465,7 +466,9 @@ with tab_chat:
                             if "internal_thought" in response_data:
                                 st.json(response_data["internal_thought"])
                             if "confidence" in response_data:
-                                st.metric("Confidence", f"{content['confidence']:.2f}")
+                                st.metric(
+                                    "Confidence", f"{response_data['confidence']:.2f}"
+                                )
                             if "sources" in response_data and response_data["sources"]:
                                 st.markdown("**Sources:**")
                                 for src in response_data["sources"]:
@@ -542,4 +545,3 @@ with tab_graph:
             st.error(f"Failed to load graph: {e}")
     else:
         st.info("No Knowledge Graph found. Mine it from the sidebar actions.")
-
